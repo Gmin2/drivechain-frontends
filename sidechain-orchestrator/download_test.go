@@ -2,12 +2,14 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -107,6 +109,25 @@ func TestExtractZip_FlattensNestedDir(t *testing.T) {
 	assert.Equal(t, "thunder-binary", string(got))
 }
 
+func TestExtractZipPreservingTreeAllowsPathTraversalToOverwriteCoreBinary(t *testing.T) {
+	dm, dir := newTestDownloadManager(t)
+
+	zipPath := filepath.Join(dir, "evil-sidechain.zip")
+	makeZipFile(t, zipPath, map[string][]byte{
+		"../../bitcoind": []byte("owned"),
+		"Thunder.app/Contents/MacOS/Thunder": []byte("sidechain"),
+	})
+
+	destDir := filepath.Join(BinDir(dir), testSidechainSubfolder, "thunder")
+	hasCLI, err := dm.extractZipPreservingTree(zipPath, destDir, "")
+	require.NoError(t, err)
+	assert.False(t, hasCLI)
+
+	got, err := os.ReadFile(filepath.Join(BinDir(dir), "bitcoind"))
+	require.NoError(t, err, "archive entry escaped the test sidechain directory into the bin directory")
+	assert.Equal(t, "owned", string(got))
+}
+
 func TestDownload_Direct(t *testing.T) {
 	dm, dir := newTestDownloadManager(t)
 	zipContent := makeZipBytes(t, map[string][]byte{"test-binary": []byte("data")})
@@ -187,6 +208,63 @@ func TestDownload_SkipsWhenExists(t *testing.T) {
 	last := drainProgress(t, ch)
 	assert.True(t, last.Done)
 	assert.Equal(t, binPath, last.Message)
+}
+
+func TestDownload_DoesNotEnforcePinnedArchiveHash(t *testing.T) {
+	dm, dir := newTestDownloadManager(t)
+	configPath := filepath.Join(dir, "chains_config.json")
+	dm.configFilePath = configPath
+
+	pinnedHash := strings.Repeat("a", 64)
+	initialConfig := fmt.Sprintf(`{
+  "version": 5,
+  "binaries": {
+    "test": {
+      "name": "test",
+      "hashes": {
+        %q: {"sha256": %q, "size": 123}
+      }
+    }
+  }
+}`, currentPlatform(), pinnedHash)
+	require.NoError(t, os.WriteFile(configPath, []byte(initialConfig), 0o644))
+
+	zipContent := makeZipBytes(t, map[string][]byte{
+		"test-binary": []byte("different archive bytes"),
+	})
+	servedHash := fmt.Sprintf("%x", sha256.Sum256(zipContent))
+	require.NotEqual(t, pinnedHash, servedHash)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(zipContent)))
+		_, _ = w.Write(zipContent)
+	}))
+	defer srv.Close()
+	dm.httpClient = srv.Client()
+
+	ch, err := dm.Download(context.Background(), BinaryConfig{
+		Name:           "test",
+		BinaryName:     "test-binary",
+		DownloadSource: DownloadSourceDirect,
+		DownloadURLs:   map[string]string{"default": srv.URL + "/"},
+		Files:          map[string]string{currentPlatform(): "test-binary.zip"},
+	}, "default", true)
+	require.NoError(t, err)
+
+	last := drainProgress(t, ch)
+	assert.True(t, last.Done)
+	got, err := os.ReadFile(BinaryPath(dir, "test-binary"))
+	require.NoError(t, err)
+	assert.Equal(t, "different archive bytes", string(got))
+
+	configBytes, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(configBytes, &raw))
+	hashes := raw["binaries"].(map[string]any)["test"].(map[string]any)["hashes"].(map[string]any)
+	platformHash := hashes[currentPlatform()].(map[string]any)["sha256"]
+	assert.Equal(t, servedHash, platformHash)
+	assert.NotEqual(t, pinnedHash, platformHash)
 }
 
 // drainProgress reads all progress from a channel, failing on errors.

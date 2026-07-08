@@ -253,6 +253,91 @@ func TestCoreBackendSendSimple(t *testing.T) {
 	require.Len(t, fake.callsFor("sendmany"), 1)
 }
 
+func TestCoreBackendSendDropsRawOutputsOnSimplePath(t *testing.T) {
+	backend, fake, coreID := newCoreBackendFixture(t)
+	fake.stubEnsureFlow()
+	fake.handle("sendtoaddress", func(bitcoindCall) (any, string) { return "txid-single", "" })
+	ctx := context.Background()
+
+	txid, err := backend.Send(ctx, coreID, SendRequest{
+		DestinationsSats: map[string]int64{"bcrt1qdest": 25_000},
+		RawOutputs: []TxOutSpec{{
+			RawScriptHex: "b4010151", // OP_DRIVECHAIN OP_PUSHBYTES_1 0x01 OP_TRUE
+			AmountSats:   600_000,
+		}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "txid-single", txid)
+
+	sends := fake.callsFor("sendtoaddress")
+	require.Len(t, sends, 1, "Core simple path was used even though a raw output was required")
+	assert.Empty(t, fake.callsFor("createrawtransaction"), "raw output never reached raw transaction construction")
+}
+
+func TestCoreBackendSendRawPathSerializesRawOutputAsEmptyAddress(t *testing.T) {
+	backend, fake, coreID := newCoreBackendFixture(t)
+	fake.stubEnsureFlow()
+
+	var createdOutputs []map[string]any
+	fake.handle("createrawtransaction", func(c bitcoindCall) (any, string) {
+		require.NoError(t, json.Unmarshal(c.Params[1], &createdOutputs))
+		return "deadbeef00112233", ""
+	})
+	fake.handle("fundrawtransaction", func(c bitcoindCall) (any, string) {
+		return map[string]any{"hex": mustString(t, c.Params[0]), "fee": 0.00001, "changepos": 1}, ""
+	})
+	fake.handle("signrawtransactionwithwallet", func(c bitcoindCall) (any, string) {
+		return map[string]any{"hex": mustString(t, c.Params[0]), "complete": true}, ""
+	})
+	fake.handle("sendrawtransaction", func(bitcoindCall) (any, string) { return "txid-funded", "" })
+
+	txid, err := backend.Send(context.Background(), coreID, SendRequest{
+		FeeRateSatPerVB: 5,
+		OpReturnHex:     "cafe",
+		RawOutputs: []TxOutSpec{{
+			RawScriptHex: "b4010151", // OP_DRIVECHAIN OP_PUSHBYTES_1 0x01 OP_TRUE
+			AmountSats:   600_000,
+		}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "txid-funded", txid)
+
+	require.Len(t, createdOutputs, 2)
+	assert.Equal(t, float64(0), createdOutputs[0][""], "raw output becomes an empty-address zero-value output")
+	assert.Equal(t, "cafe", createdOutputs[1]["data"])
+}
+
+func TestCoreBackendSendRawPathDropsExternalInputs(t *testing.T) {
+	backend, fake, coreID := newCoreBackendFixture(t)
+	fake.stubEnsureFlow()
+
+	var createdInputs []RawInput
+	fake.handle("createrawtransaction", func(c bitcoindCall) (any, string) {
+		require.NoError(t, json.Unmarshal(c.Params[0], &createdInputs))
+		return "deadbeef00112233", ""
+	})
+	fake.handle("fundrawtransaction", func(c bitcoindCall) (any, string) {
+		return map[string]any{"hex": mustString(t, c.Params[0]), "fee": 0.00001, "changepos": 1}, ""
+	})
+	fake.handle("signrawtransactionwithwallet", func(c bitcoindCall) (any, string) {
+		return map[string]any{"hex": mustString(t, c.Params[0]), "complete": true}, ""
+	})
+	fake.handle("sendrawtransaction", func(bitcoindCall) (any, string) { return "txid-funded", "" })
+
+	_, err := backend.Send(context.Background(), coreID, SendRequest{
+		FeeRateSatPerVB: 5,
+		OpReturnHex:     "cafe",
+		ExternalInputs: []ExternalInput{{
+			TxID:       strings.Repeat("11", 32),
+			Vout:       0,
+			AmountSats: 500_000,
+		}},
+	})
+	require.NoError(t, err)
+
+	assert.Empty(t, createdInputs, "external CTIP input was accepted by the request but omitted from createrawtransaction")
+}
+
 func TestCoreBackendSendFeeRatePath(t *testing.T) {
 	backend, fake, coreID := newCoreBackendFixture(t)
 	fake.stubEnsureFlow()
